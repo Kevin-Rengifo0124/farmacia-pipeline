@@ -1,0 +1,6 @@
+.git
+.github
+images
+src
+*.md
+!target/DSS_P4.war

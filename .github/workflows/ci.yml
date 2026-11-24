@@ -1,0 +1,228 @@
+# ─────────────────────────────────────────────────────────────────────────────
+# Pipeline CI/CD — GitHub Actions
+# Basado en Documentos/PIPELINE_DEVOPS.md y Documentos/github-actions.yml
+#
+# Pasos:
+#   1. Trigger por push (main, develop) o pull request hacia main
+#   2. Infraestructura: runner Ubuntu + JDK 8 / imagen Docker (Tomcat 9)
+#   3. Checkout del código
+#   4. Resolución de dependencias + compilación (Maven, genera el WAR)
+#   5. Pruebas unitarias (JUnit 5)
+#   6. Despliegue al runtime (opcional, ver job "deploy")
+# ─────────────────────────────────────────────────────────────────────────────
+
+name: Pipeline CI/CD
+
+# ── 1. TRIGGER ────────────────────────────────────────────────────────────────
+on:
+  push:
+    branches:
+      - main
+      - develop
+  pull_request:
+    branches:
+      - main
+
+env:
+  REGISTRY: ghcr.io
+  JAVA_VERSION: "8"
+
+jobs:
+
+  # ────────────────────────────────────────────────────────────────────────────
+  # JOB 1: BUILD & TEST  (pasos 2, 3, 4 y 5)
+  # ────────────────────────────────────────────────────────────────────────────
+  build-and-test:
+    name: "Build & Test"
+    runs-on: ubuntu-latest
+
+    steps:
+      # ── 3. CHECKOUT ─────────────────────────────────────────────────────────
+      - name: Checkout código
+        uses: actions/checkout@v4
+
+      # ── 2. INFRAESTRUCTURA: runtime de Java ─────────────────────────────────
+      - name: Configurar JDK ${{ env.JAVA_VERSION }}
+        uses: actions/setup-java@v4
+        with:
+          java-version: ${{ env.JAVA_VERSION }}
+          distribution: temurin
+          cache: maven
+
+      # ── 4. DEPENDENCIAS Y COMPILACIÓN ───────────────────────────────────────
+      - name: Resolver dependencias
+        run: mvn -B dependency:go-offline
+
+      - name: Compilar
+        run: mvn -B clean compile
+
+      # ── 5. PRUEBAS UNITARIAS ────────────────────────────────────────────────
+      # Si algún test falla, el pipeline se detiene aquí y no se empaqueta ni se despliega.
+      - name: Ejecutar pruebas unitarias
+        run: mvn -B test
+
+      - name: Guardar reportes de pruebas
+        uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: surefire-reports
+          path: target/surefire-reports/
+          retention-days: 30
+
+      # ── 4b. EMPAQUETADO (solo si los tests pasaron) ─────────────────────────
+      - name: Empaquetar WAR
+        run: mvn -B package -DskipTests
+
+      - name: Guardar WAR como artefacto
+        uses: actions/upload-artifact@v4
+        with:
+          name: war
+          path: target/DSS_P4.war
+          retention-days: 30
+
+  # ────────────────────────────────────────────────────────────────────────────
+  # JOB 2: DOCKER BUILD & PUSH  (paso 2 / 6)
+  # Solo en push a main o develop, nunca en pull requests.
+  # ────────────────────────────────────────────────────────────────────────────
+  docker-build:
+    name: "Docker Build & Push"
+    runs-on: ubuntu-latest
+    needs: build-and-test
+    if: github.event_name == 'push'
+    permissions:
+      contents: read
+      packages: write
+    outputs:
+      digest: ${{ steps.push.outputs.digest }}
+
+    steps:
+      - name: Checkout código
+        uses: actions/checkout@v4
+
+      - name: Descargar WAR del job anterior
+        uses: actions/download-artifact@v4
+        with:
+          name: war
+          path: target
+
+      # GHCR exige el nombre de imagen en minúsculas
+      - name: Nombre de imagen en minúsculas
+        run: echo "IMAGE_NAME=${GITHUB_REPOSITORY,,}" >> "$GITHUB_ENV"
+
+      - name: Configurar Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Login al Container Registry
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Generar metadata de imagen
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
+          tags: |
+            type=ref,event=branch
+            type=sha,prefix=sha-
+            type=raw,value=latest,enable=${{ github.ref == 'refs/heads/main' }}
+
+      - name: Build & Push imagen Docker
+        id: push
+        uses: docker/build-push-action@v5
+        with:
+          context: .
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+  # ────────────────────────────────────────────────────────────────────────────
+  # JOB 3: DEPLOY AL RUNTIME EN GITHUB  (paso 6)
+  # Levanta la imagen recién publicada como contenedor en el runner y comprueba
+  # que Tomcat arranca y que la aplicación Jersey responde. Si falla, el pipeline
+  # falla. No requiere servidor ni secrets.
+  # ────────────────────────────────────────────────────────────────────────────
+  smoke-test:
+    name: "Deploy a Runtime (smoke test)"
+    runs-on: ubuntu-latest
+    needs: docker-build
+    permissions:
+      contents: read
+      packages: read
+
+    steps:
+      - name: Nombre de imagen en minúsculas
+        run: echo "IMAGE_NAME=${GITHUB_REPOSITORY,,}" >> "$GITHUB_ENV"
+
+      - name: Login al Container Registry
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Levantar el contenedor
+        run: |
+          docker run -d --name farmacia -p 8080:8080 \
+            "${REGISTRY}/${IMAGE_NAME}@${{ needs.docker-build.outputs.digest }}"
+
+      - name: Esperar a que la aplicación responda
+        run: |
+          URL="http://localhost:8080/DSS_P4/webapi/application.wadl"
+          for i in $(seq 1 30); do
+            CODE=$(curl -s -o /dev/null -w "%{http_code}" "$URL" || true)
+            echo "Intento $i: HTTP $CODE"
+            if [ "$CODE" = "200" ]; then
+              echo "La aplicación está desplegada y responde."
+              exit 0
+            fi
+            sleep 5
+          done
+          echo "La aplicación no respondió a tiempo. Logs de Tomcat:"
+          docker logs farmacia
+          exit 1
+
+      - name: Logs del contenedor
+        if: always()
+        run: docker logs farmacia || true
+
+      - name: Detener el contenedor
+        if: always()
+        run: docker rm -f farmacia || true
+
+  # ────────────────────────────────────────────────────────────────────────────
+  # JOB 4: DEPLOY A SERVIDOR REMOTO POR SSH  (paso 6, opcional)
+  # Desactivado por defecto: necesita un servidor y secrets.
+  # Para activarlo: Settings → Secrets and variables → Actions → Variables,
+  # crear DEPLOY_ENABLED = true, y crear los secrets SSH_HOST, SSH_USER, SSH_PRIVATE_KEY.
+  # ────────────────────────────────────────────────────────────────────────────
+  deploy:
+    name: "Deploy a servidor (SSH)"
+    runs-on: ubuntu-latest
+    needs: smoke-test
+    if: github.ref == 'refs/heads/main' && vars.DEPLOY_ENABLED == 'true'
+    environment: production
+
+    steps:
+      - name: Nombre de imagen en minúsculas
+        run: echo "IMAGE_NAME=${GITHUB_REPOSITORY,,}" >> "$GITHUB_ENV"
+
+      - name: Deploy via SSH
+        uses: appleboy/ssh-action@v1
+        with:
+          host: ${{ secrets.SSH_HOST }}
+          username: ${{ secrets.SSH_USER }}
+          key: ${{ secrets.SSH_PRIVATE_KEY }}
+          script: |
+            docker pull ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:latest
+            docker rm -f farmacia || true
+            docker run -d --name farmacia -p 8080:8080 ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:latest
+            docker image prune -f
+
+      - name: Notificar resultado
+        if: always()
+        run: echo "Deploy ${{ job.status }} en ${{ github.ref_name }} @ ${GITHUB_SHA:0:7}"
