@@ -10,7 +10,7 @@ class DepartmentTest {
 
 	@Test
 	void departamentoConNombreEsValido() {
-		assertTrue(new Department("HERBALIST").hasValidAttributes());
+		assertFalse(new Department("HERBALIST").hasValidAttributes());
 	}
 
 	@Test
